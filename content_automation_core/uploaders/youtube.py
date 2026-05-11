@@ -457,6 +457,98 @@ class YouTubeUploader:
 
     # ── Step: walk through Next buttons ────────────────────────────────────
 
+    def _dump_visible_controls(self, where: str) -> None:
+        """One-shot diagnostic: log every visible <button> / <ytcp-button>.
+
+        Triggered only on real failures so production logs stay clean. Used
+        to discover the actual aria-label / id / text of Studio buttons when
+        the existing selectors miss them.
+        """
+        try:
+            items = safe_driver_call(
+                lambda: self.session.driver.execute_script(
+                    """
+                    var out = [];
+                    var sel = 'button, ytcp-button, tp-yt-paper-button';
+                    var nodes = document.querySelectorAll(sel);
+                    for (var i = 0; i < nodes.length && out.length < 60; i++) {
+                        var b = nodes[i];
+                        var rect = b.getBoundingClientRect();
+                        if (rect.width < 2 || rect.height < 2) continue;
+                        var cs = window.getComputedStyle(b);
+                        if (cs.visibility === 'hidden' || cs.display === 'none') continue;
+                        out.push({
+                            tag: b.tagName.toLowerCase(),
+                            id: b.id || '',
+                            label: b.getAttribute('aria-label') || '',
+                            text: (b.innerText || b.textContent || '').trim().slice(0, 60),
+                            disabled: b.getAttribute('aria-disabled') || (b.disabled ? 'true' : '')
+                        });
+                    }
+                    return out;
+                    """
+                ),
+                timeout=10,
+            ) or []
+        except Exception as e:
+            logger.warning(f"{self.log_prefix}[DIAG] dump failed at {where}: {e}")
+            return
+        logger.warning(
+            f"{self.log_prefix}[DIAG] visible controls at {where}: {len(items)}"
+        )
+        for info in items:
+            logger.warning(
+                f"{self.log_prefix}[DIAG] {where} "
+                f"tag={info.get('tag')} id={info.get('id')!r} "
+                f"label={info.get('label')!r} text={info.get('text')!r} "
+                f"disabled={info.get('disabled')!r}"
+            )
+
+    def _scroll_dialog_and_body(self, fraction: float = 1.0) -> None:
+        """Scroll inside ``ytcp-uploads-dialog`` AND on the body.
+
+        YouTube Studio renders the upload form inside a Polymer dialog that
+        has its own scroll container; document.body scroll does not reach
+        the Visibility / Publish controls when they are lazy-rendered below
+        the fold.
+        """
+        try:
+            safe_driver_call(
+                lambda: self.session.driver.execute_script(
+                    """
+                    var frac = arguments[0];
+                    function scrollTo(el) {
+                        if (!el) return;
+                        try {
+                            el.scrollTop = (el.scrollHeight || 0) * frac;
+                        } catch (e) {}
+                    }
+                    scrollTo(document.scrollingElement || document.documentElement);
+                    scrollTo(document.body);
+                    var dlg = document.querySelector('ytcp-uploads-dialog');
+                    if (dlg) {
+                        var candidates = dlg.querySelectorAll('*');
+                        for (var i = 0; i < candidates.length; i++) {
+                            var c = candidates[i];
+                            try {
+                                var cs = window.getComputedStyle(c);
+                                if (!cs) continue;
+                                if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll')
+                                    && c.scrollHeight > c.clientHeight + 4) {
+                                    scrollTo(c);
+                                }
+                            } catch (e) {}
+                        }
+                    }
+                    return true;
+                    """,
+                    fraction,
+                ),
+                timeout=10,
+            )
+        except Exception:
+            pass
+
     _NEXT_BUTTON_XPATH = (
         "//ytcp-button[@id='next-button']//button"
         " | //button[@aria-label='Next']"
@@ -469,6 +561,7 @@ class YouTubeUploader:
         clicked = 0
         for step in range(4):
             time.sleep(2)
+            self._scroll_dialog_and_body(0.5)
             try:
                 btn = safe_driver_call(
                     lambda: WebDriverWait(self.session.driver, 10).until(
@@ -484,6 +577,8 @@ class YouTubeUploader:
                 logger.info(
                     f"{self.log_prefix}[WORKFLOW] no more Next buttons (step {step + 1})"
                 )
+                if step == 0:
+                    self._dump_visible_controls("next-missing")
                 break
 
             try:
@@ -569,11 +664,21 @@ class YouTubeUploader:
             "//button[contains(@class,'ytcpButtonShapeImplHost') and @aria-label='Publish']",
             "//ytcp-button[@id='done-button']",
             "//*[@id='done-button']",
+            "//button[@aria-label='Save']",
+            "//button[@aria-label='Schedule']",
             "//button[normalize-space(text())='Publish']",
             "//button[normalize-space(text())='Save']",
+            "//button[normalize-space(text())='Schedule']",
+            "//button[normalize-space(text())='Done']",
+            "//ytcp-button[contains(., 'Publish')]//button",
+            "//ytcp-button[contains(., 'Save')]//button",
         )
         deadline = time.time() + 70
+        scrolled_once = False
         while time.time() < deadline:
+            if not scrolled_once:
+                self._scroll_dialog_and_body(1.0)
+                scrolled_once = True
             for xp in save_xpaths:
                 try:
                     el = safe_driver_call(
@@ -605,6 +710,9 @@ class YouTubeUploader:
                         var sel = [
                           'ytcp-button#done-button button',
                           'button[aria-label="Publish"]',
+                          'button[aria-label="Save"]',
+                          'button[aria-label="Schedule"]',
+                          'button[aria-label="Done"]',
                           'ytcp-button#done-button'
                         ];
                         for (var s = 0; s < sel.length; s++) {
@@ -613,8 +721,10 @@ class YouTubeUploader:
                             var b = nodes[i];
                             if (b.getAttribute('aria-disabled') === 'true') continue;
                             var t = (b.innerText || b.textContent || '').trim();
-                            if (t === 'Publish' || t === 'Save' ||
-                                b.getAttribute('aria-label') === 'Publish') {
+                            var lbl = b.getAttribute('aria-label') || '';
+                            if (t === 'Publish' || t === 'Save' || t === 'Schedule'
+                                || t === 'Done' || lbl === 'Publish' || lbl === 'Save'
+                                || lbl === 'Schedule' || lbl === 'Done') {
                               b.click();
                               return true;
                             }
@@ -652,6 +762,7 @@ class YouTubeUploader:
             )
         except Exception:
             pass
+        self._scroll_dialog_and_body(0.5)
 
         try:
             safe_driver_call(
@@ -679,6 +790,7 @@ class YouTubeUploader:
             logger.warning(
                 f"{self.log_prefix}[VISIBILITY] could not set explicitly — proceeding"
             )
+            self._dump_visible_controls("visibility-missing")
 
         time.sleep(1.5)
 
@@ -697,6 +809,7 @@ class YouTubeUploader:
             logger.info(f"{self.log_prefix}[PUBLISH] save/publish clicked")
         else:
             logger.error(f"{self.log_prefix}[PUBLISH] could not find save/publish button")
+            self._dump_visible_controls("publish-missing")
             return False
 
         time.sleep(3)
