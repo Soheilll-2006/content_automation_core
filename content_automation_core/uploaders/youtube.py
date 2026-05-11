@@ -612,11 +612,16 @@ class YouTubeUploader:
 
     def _yt_click_visibility_radio(self, target: str) -> bool:
         """Polymer ``tp-yt-paper-radio-button``: click inner target, then JS."""
+        title = target.capitalize()
         xpaths = (
             f"//tp-yt-paper-radio-button[@name='{target}']//div[@id='radioContainer']",
             f"//tp-yt-paper-radio-button[@name='{target}']//div[@id='radioLabel']",
             f"//tp-yt-paper-radio-button[@name='{target}']",
             f"//paper-radio-button[@name='{target}']",
+            f"//tp-yt-paper-radio-group[@id='privacy-radios']"
+            f"//tp-yt-paper-radio-button[contains(., '{title}')]",
+            f"//*[normalize-space(text())='{title}']/ancestor::tp-yt-paper-radio-button",
+            f"//*[normalize-space(text())='{title}']/ancestor::paper-radio-button",
         )
         for xp in xpaths:
             try:
@@ -632,6 +637,30 @@ class YouTubeUploader:
                 raise
             except Exception:
                 continue
+
+        # Last resort: enumerate every radio button and match by visible text.
+        try:
+            radios = safe_driver_call(
+                lambda: self.session.driver.find_elements(
+                    By.XPATH, "//tp-yt-paper-radio-button | //paper-radio-button"
+                ),
+                timeout=8,
+            ) or []
+        except Exception:
+            radios = []
+        needle = target.lower()
+        for radio in radios:
+            try:
+                txt = safe_driver_call(lambda r=radio: r.text or "", timeout=4)
+            except Exception:
+                txt = ""
+            if needle in (txt or "").lower():
+                try:
+                    if self.session.safe_click(radio):
+                        return True
+                except Exception:
+                    continue
+
         try:
             ok = safe_driver_call(
                 lambda: self.session.driver.execute_script(
@@ -672,6 +701,10 @@ class YouTubeUploader:
             "//button[normalize-space(text())='Done']",
             "//ytcp-button[contains(., 'Publish')]//button",
             "//ytcp-button[contains(., 'Save')]//button",
+            # text → ancestor (works when text lives in nested div)
+            "//*[normalize-space(text())='Publish']/ancestor::ytcp-button",
+            "//*[normalize-space(text())='Save']/ancestor::ytcp-button",
+            "//*[normalize-space(text())='Schedule']/ancestor::ytcp-button",
         )
         deadline = time.time() + 70
         scrolled_once = False
