@@ -53,6 +53,7 @@ from ._browser import (
     GLOBAL_UPLOAD_TIMEOUT,
     NavigationError,
     SAFE_COMMAND_TIMEOUT,
+    SCRIPT_TIMEOUT,
     run_with_upload_timeout,
     safe_driver_call,
     setup_logging,
@@ -514,6 +515,123 @@ class YouTubeUploader:
         logger.info(f"{self.log_prefix}[WORKFLOW] clicked Next {clicked} time(s)")
         return True
 
+    def _yt_click_visibility_radio(self, target: str) -> bool:
+        """Polymer ``tp-yt-paper-radio-button``: click inner target, then JS."""
+        xpaths = (
+            f"//tp-yt-paper-radio-button[@name='{target}']//div[@id='radioContainer']",
+            f"//tp-yt-paper-radio-button[@name='{target}']//div[@id='radioLabel']",
+            f"//tp-yt-paper-radio-button[@name='{target}']",
+            f"//paper-radio-button[@name='{target}']",
+        )
+        for xp in xpaths:
+            try:
+                el = safe_driver_call(
+                    lambda x=xp: WebDriverWait(self.session.driver, 8).until(
+                        EC.presence_of_element_located((By.XPATH, x))
+                    ),
+                    timeout=10,
+                )
+                if el is not None and self.session.safe_click(el):
+                    return True
+            except DriverUnhealthyError:
+                raise
+            except Exception:
+                continue
+        try:
+            ok = safe_driver_call(
+                lambda: self.session.driver.execute_script(
+                    """
+                    var name = arguments[0];
+                    var el = document.querySelector(
+                        'tp-yt-paper-radio-button[name="' + name + '"]'
+                    );
+                    if (!el) return false;
+                    var inner = el.querySelector('#radioContainer')
+                        || el.querySelector('#radioLabel');
+                    if (inner) { inner.click(); return true; }
+                    el.click();
+                    return true;
+                    """,
+                    target,
+                ),
+                timeout=min(15, SCRIPT_TIMEOUT),
+            )
+            return bool(ok)
+        except Exception:
+            return False
+
+    def _yt_click_publish(self) -> bool:
+        """Publish / Save with XPath round-robin + JS fallback (waits up to ~70s)."""
+        save_xpaths = (
+            "//ytcp-button[@id='done-button']//button",
+            "//button[@aria-label='Publish' and not(@aria-disabled='true')]",
+            "//button[@aria-label='Publish']",
+            "//button[contains(@class,'ytcpButtonShapeImplHost') and @aria-label='Publish']",
+            "//ytcp-button[@id='done-button']",
+            "//*[@id='done-button']",
+            "//button[normalize-space(text())='Publish']",
+            "//button[normalize-space(text())='Save']",
+        )
+        deadline = time.time() + 70
+        while time.time() < deadline:
+            for xp in save_xpaths:
+                try:
+                    el = safe_driver_call(
+                        lambda x=xp: WebDriverWait(self.session.driver, 4).until(
+                            EC.presence_of_element_located((By.XPATH, x))
+                        ),
+                        timeout=8,
+                    )
+                    if el is None:
+                        continue
+                    try:
+                        ad = safe_driver_call(
+                            lambda: el.get_attribute("aria-disabled"), timeout=3
+                        )
+                    except Exception:
+                        ad = None
+                    if ad and ad.lower() == "true":
+                        continue
+                    if self.session.safe_click(el):
+                        return True
+                except DriverUnhealthyError:
+                    raise
+                except Exception:
+                    continue
+            try:
+                ok = safe_driver_call(
+                    lambda: self.session.driver.execute_script(
+                        """
+                        var sel = [
+                          'ytcp-button#done-button button',
+                          'button[aria-label="Publish"]',
+                          'ytcp-button#done-button'
+                        ];
+                        for (var s = 0; s < sel.length; s++) {
+                          var nodes = document.querySelectorAll(sel[s]);
+                          for (var i = 0; i < nodes.length; i++) {
+                            var b = nodes[i];
+                            if (b.getAttribute('aria-disabled') === 'true') continue;
+                            var t = (b.innerText || b.textContent || '').trim();
+                            if (t === 'Publish' || t === 'Save' ||
+                                b.getAttribute('aria-label') === 'Publish') {
+                              b.click();
+                              return true;
+                            }
+                          }
+                        }
+                        return false;
+                        """
+                    ),
+                    timeout=min(15, SCRIPT_TIMEOUT),
+                )
+                if ok:
+                    return True
+            except Exception:
+                pass
+            time.sleep(1.5)
+        return False
+
     # ── Step: visibility + save/publish ────────────────────────────────────
 
     def _set_visibility_and_save(self, visibility: str) -> bool:
@@ -525,80 +643,59 @@ class YouTubeUploader:
             "scheduled": "SCHEDULED",
         }.get(visibility.lower(), "PUBLIC")
 
-        # tabindex=-1 + Polymer custom element confuses element_to_be_clickable;
-        # use presence and let safe_click do the heavy lifting (scroll + JS click).
-        vis_selectors = (
-            f"//tp-yt-paper-radio-button[@name='{target}']",
-            f"//paper-radio-button[@name='{target}']",
-            f"//tp-yt-paper-radio-button[@id='{visibility.lower()}-radio-button']",
-            f"//tp-yt-paper-radio-button[contains(@aria-label, "
-            f"'{visibility.title()}')]",
-            f"//*[@name='{target}'][@role='radio']",
-        )
+        try:
+            safe_driver_call(
+                lambda: self.session.driver.execute_script(
+                    "window.scrollTo(0, Math.max(0, document.body.scrollHeight * 0.35));"
+                ),
+                timeout=8,
+            )
+        except Exception:
+            pass
 
-        vis_set = False
-        for xp in vis_selectors:
-            try:
-                el = safe_driver_call(
-                    lambda x=xp: WebDriverWait(self.session.driver, 6).until(
-                        EC.presence_of_element_located((By.XPATH, x))
-                    ),
-                    timeout=10,
-                )
-                if el is not None and self.session.safe_click(el):
-                    logger.info(f"{self.log_prefix}[VISIBILITY] set to {visibility}")
-                    vis_set = True
-                    break
-            except DriverUnhealthyError:
-                raise
-            except Exception:
-                continue
+        try:
+            safe_driver_call(
+                lambda: WebDriverWait(self.session.driver, 20).until(
+                    EC.presence_of_element_located(
+                        (
+                            By.XPATH,
+                            "//ytcp-video-visibility-select | "
+                            "//tp-yt-paper-radio-button[@name='PUBLIC'] | "
+                            "//tp-yt-paper-radio-button[@name='PRIVATE']",
+                        )
+                    )
+                ),
+                timeout=25,
+            )
+        except Exception:
+            logger.debug(
+                f"{self.log_prefix}[VISIBILITY] visibility block not detected yet"
+            )
 
-        if not vis_set:
-            logger.warning(f"{self.log_prefix}[VISIBILITY] could not set explicitly — proceeding")
+        vis_set = self._yt_click_visibility_radio(target)
+        if vis_set:
+            logger.info(f"{self.log_prefix}[VISIBILITY] set to {visibility}")
+        else:
+            logger.warning(
+                f"{self.log_prefix}[VISIBILITY] could not set explicitly — proceeding"
+            )
 
         time.sleep(1.5)
 
-        # Click Save / Publish — current Studio renders nested <button>
-        # inside <ytcp-button id="done-button">.
-        save_selectors = (
-            "//ytcp-button[@id='done-button']//button",
-            "//ytcp-button[@id='done-button']",
-            "//*[@id='done-button']",
-            "//button[@aria-label='Publish']",
-            "//button[@aria-label='Save']",
-            "//button[normalize-space(text())='Publish']",
-            "//button[normalize-space(text())='Save']",
-        )
-        clicked = False
-        for xp in save_selectors:
-            try:
-                el = safe_driver_call(
-                    lambda x=xp: WebDriverWait(self.session.driver, 8).until(
-                        EC.presence_of_element_located((By.XPATH, x))
-                    ),
-                    timeout=12,
-                )
-                if el is None:
-                    continue
-                try:
-                    aria_disabled = safe_driver_call(
-                        lambda: el.get_attribute("aria-disabled"), timeout=4
-                    )
-                except Exception:
-                    aria_disabled = None
-                if aria_disabled and aria_disabled.lower() == "true":
-                    continue
-                if self.session.safe_click(el):
-                    logger.info(f"{self.log_prefix}[PUBLISH] save/publish clicked")
-                    clicked = True
-                    break
-            except DriverUnhealthyError:
-                raise
-            except Exception:
-                continue
+        try:
+            safe_driver_call(
+                lambda: self.session.driver.execute_script(
+                    "window.scrollTo(0, document.body.scrollHeight);"
+                ),
+                timeout=8,
+            )
+        except Exception:
+            pass
+        time.sleep(0.5)
 
-        if not clicked:
+        if self._yt_click_publish():
+            logger.info(f"{self.log_prefix}[PUBLISH] save/publish clicked")
+        else:
             logger.error(f"{self.log_prefix}[PUBLISH] could not find save/publish button")
             return False
 

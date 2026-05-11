@@ -998,6 +998,10 @@ class BrowserSession:
           viewport with z-index > 1000 AND pointer-events != 'none' AND
           tag is not html/body/main. Disable pointer events and remove it.
 
+        On ``publish.buffer.com`` / ``buffer.com`` URLs, phase 2 is skipped
+        entirely — the generic detector matches legitimate Buffer layout
+        shells and breaks React hydration (shell not rendering for ~30s).
+
         Returns the total number of elements affected (phase 1 + phase 2).
         """
         if not self._is_open():
@@ -1016,6 +1020,18 @@ class BrowserSession:
             return total
         except Exception as e:  # noqa: BLE001
             logger.debug(f"{self.log_prefix}[OVERLAY] hints script failed: {e}")
+
+        # Buffer / publish.buffer.com: NEVER run the generic structural phase.
+        # It matches legitimate high-z-index layout shells (~32% viewport) and
+        # removes them, which breaks React hydration — "Buffer shell did not
+        # render" for 30s until a full browser recreate. Joyride hints (phase 1)
+        # are sufficient on Buffer.
+        try:
+            page_url = (self.current_url() or "").lower()
+        except Exception:
+            page_url = ""
+        if "buffer.com" in page_url:
+            return total
 
         # Phase 2: generic detector.
         try:

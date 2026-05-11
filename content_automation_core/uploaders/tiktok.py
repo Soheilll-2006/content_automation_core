@@ -220,9 +220,12 @@ class TikTokUploader:
     # ── upload page navigation ─────────────────────────────────────────────
 
     _UPLOAD_URLS = (
-        "https://www.tiktok.com/tiktok-studio/upload",
+        # Region/account-dependent: hyphenated "tiktok-studio" often 404s;
+        # "tiktokstudio" (no hyphen) is the working studio path in production logs.
+        "https://www.tiktok.com/tiktokstudio/upload",
         "https://www.tiktok.com/upload",
         "https://www.tiktok.com/creator-center/upload",
+        "https://www.tiktok.com/tiktok-studio/upload",
     )
 
     def _find_input_in_main_or_iframe(self, timeout: float):
@@ -316,6 +319,11 @@ class TikTokUploader:
                     f"{self.log_prefix}[NAV] redirected to login — cookies invalid"
                 )
                 return None
+            if "/404" in low:
+                logger.warning(
+                    f"{self.log_prefix}[NAV] upload URL returned 404 — trying next"
+                )
+                continue
             el = self._find_input_in_main_or_iframe(timeout=20)
             if el is not None:
                 return el
