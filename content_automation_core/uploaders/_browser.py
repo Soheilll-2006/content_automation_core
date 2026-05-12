@@ -1010,18 +1010,28 @@ class BrowserSession:
           viewport with z-index > 1000 AND pointer-events != 'none' AND
           tag is not html/body/main. Disable pointer events and remove it.
 
-        On ``publish.buffer.com`` / ``buffer.com`` URLs, phase 2 is skipped
-        entirely — the generic detector matches legitimate Buffer layout
-        shells and breaks React hydration (shell not rendering for ~30s).
+        On ``publish.buffer.com`` / ``buffer.com`` URLs, only phase 2 is skipped
+        (phase 1 Joyride hints still run) — the generic detector matches
+        legitimate layout shells and breaks React hydration.
 
-        On ``studio.youtube.com`` / ``youtube.com/upload``, phase 2 is also
-        skipped — the same detector removes ``tp-yt-iron-overlay-backdrop``,
-        which is part of YouTube Studio's modal stack; removing it closes the
-        upload wizard and leaves only the channel list chrome.
+        On ``studio.youtube.com`` / ``youtube.com/upload``, **both** phases are
+        skipped — phase 1 can click a generic ``Close`` control and dismiss the
+        upload wizard; phase 2 can remove ``tp-yt-iron-overlay-backdrop``.
 
         Returns the total number of elements affected (phase 1 + phase 2).
         """
         if not self._is_open():
+            return 0
+
+        try:
+            page_url = (self.current_url() or "").lower()
+        except Exception:
+            page_url = ""
+
+        # YouTube Studio / upload entry: never run hint clicks or generic removal.
+        # Phase-1 selectors include ``button[aria-label="Close"]``, which matches
+        # Studio's upload dialog close control and removes ``ytcp-uploads-dialog``.
+        if "studio.youtube.com" in page_url or "youtube.com/upload" in page_url:
             return 0
 
         total = 0
@@ -1043,16 +1053,7 @@ class BrowserSession:
         # removes them, which breaks React hydration — "Buffer shell did not
         # render" for 30s until a full browser recreate. Joyride hints (phase 1)
         # are sufficient on Buffer.
-        try:
-            page_url = (self.current_url() or "").lower()
-        except Exception:
-            page_url = ""
         if "buffer.com" in page_url:
-            return total
-
-        # YouTube Studio upload shell: same class of false positives as Buffer —
-        # high-z fixed layers and modal backdrops are part of the real UI.
-        if "studio.youtube.com" in page_url or "youtube.com/upload" in page_url:
             return total
 
         # Phase 2: generic detector.

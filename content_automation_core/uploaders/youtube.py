@@ -459,11 +459,22 @@ class YouTubeUploader:
         Polymer often re-renders ``ytcp-social-suggestions-textbox`` shortly
         after the user starts typing into a SIBLING textbox (title → description
         cascade). The cached WebElement we returned a moment ago can therefore
-        go stale before send_keys completes. We re-find ONCE on stale — not
-        a retry loop — and abort cleanly if it still fails.
+        go stale before send_keys completes. We re-find a few times on failure —
+        bounded, not an infinite loop.
         """
-        for attempt in (1, 2):
-            el = self._wait_first_element(xpaths, timeout=timeout, clickable=False)
+        for attempt in (1, 2, 3):
+            if not self._upload_dialog_js_present():
+                logger.error(
+                    f"{self.log_prefix}[DETAILS] {label}: ytcp-uploads-dialog "
+                    f"not in DOM — aborting"
+                )
+                return False
+            el = self._wait_first_element(
+                xpaths,
+                timeout=timeout,
+                clickable=False,
+                abort_if_no_upload_dialog=True,
+            )
             if el is None:
                 logger.warning(f"{self.log_prefix}[DETAILS] {label} field not found")
                 return False
@@ -471,18 +482,33 @@ class YouTubeUploader:
                 if self.session.safe_send_keys(el, text):
                     return True
             except StaleElementReferenceException:
-                if attempt == 1:
+                if attempt < 3:
                     logger.info(
-                        f"{self.log_prefix}[DETAILS] {label} went stale — re-finding once"
+                        f"{self.log_prefix}[DETAILS] {label} went stale — re-finding"
                     )
                     continue
-            # safe_send_keys returned False — if first attempt, give Polymer
-            # a moment to settle and try once more.
-            if attempt == 1:
-                time.sleep(0.5)
+            if attempt < 3:
+                logger.info(
+                    f"{self.log_prefix}[DETAILS] {label} TYPE failed — re-finding "
+                    f"(attempt {attempt}/3)"
+                )
+                time.sleep(0.4)
                 continue
             return False
         return False
+
+    def _upload_dialog_js_present(self) -> bool:
+        """Cheap DOM check — ``safe_send_keys`` / hints must not dismiss the wizard."""
+        try:
+            v = safe_driver_call(
+                lambda: self.session.driver.execute_script(
+                    "return !!document.querySelector('ytcp-uploads-dialog');"
+                ),
+                timeout=5,
+            )
+            return bool(v)
+        except Exception:
+            return False
 
     def _wait_first_element(
         self,
@@ -490,6 +516,7 @@ class YouTubeUploader:
         timeout: int,
         *,
         clickable: bool = False,
+        abort_if_no_upload_dialog: bool = False,
     ):
         """Try each XPath in order with a shared wall-clock budget.
 
@@ -497,12 +524,34 @@ class YouTubeUploader:
         (overlays, shadow boundaries). For title/description use
         ``clickable=False`` (presence only); ``safe_send_keys`` scrolls and
         dismisses overlays before typing.
+
+        If ``abort_if_no_upload_dialog`` is True, abort as soon as
+        ``ytcp-uploads-dialog`` disappears from the DOM (fail fast instead of
+        spending the full XPath budget after the wizard was closed).
         """
         if not xpaths:
             return None
         deadline = time.time() + timeout
         ec = EC.element_to_be_clickable if clickable else EC.presence_of_element_located
         for xp in xpaths:
+            if abort_if_no_upload_dialog:
+                try:
+                    present = safe_driver_call(
+                        lambda: self.session.driver.execute_script(
+                            "return !!document.querySelector('ytcp-uploads-dialog');"
+                        ),
+                        timeout=4,
+                    )
+                    if present is False:
+                        logger.warning(
+                            f"{self.log_prefix}[DETAILS] ytcp-uploads-dialog "
+                            f"gone during wait — aborting element search"
+                        )
+                        return None
+                except DriverUnhealthyError:
+                    raise
+                except Exception:
+                    pass
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
