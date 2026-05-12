@@ -503,6 +503,18 @@ _GENERIC_BLOCKING_OVERLAY_JS = r"""
         var tag = el.tagName.toLowerCase();
         if (tag === 'html' || tag === 'body' || tag === 'main') continue;
 
+        // Polymer / Material modal backdrops (YouTube Studio upload wizard).
+        // They cover the viewport and have no interactive children, so the
+        // detector would remove them — that tears down the upload dialog and
+        // leaves only the channel list chrome (Next/Publish never found).
+        if (tag === 'tp-yt-iron-overlay-backdrop' || tag === 'iron-overlay-backdrop') {
+            continue;
+        }
+        try {
+            var cls = typeof el.className === 'string' ? el.className : '';
+            if (cls.indexOf('iron-overlay-backdrop') !== -1) continue;
+        } catch (e) {}
+
         // CRITICAL: don't remove dialogs / modals / forms.
         // YouTube Studio's ytcp-uploads-dialog, native <dialog>, role=dialog,
         // and anything that contains interactive controls (input, textarea,
@@ -1002,6 +1014,11 @@ class BrowserSession:
         entirely — the generic detector matches legitimate Buffer layout
         shells and breaks React hydration (shell not rendering for ~30s).
 
+        On ``studio.youtube.com`` / ``youtube.com/upload``, phase 2 is also
+        skipped — the same detector removes ``tp-yt-iron-overlay-backdrop``,
+        which is part of YouTube Studio's modal stack; removing it closes the
+        upload wizard and leaves only the channel list chrome.
+
         Returns the total number of elements affected (phase 1 + phase 2).
         """
         if not self._is_open():
@@ -1031,6 +1048,11 @@ class BrowserSession:
         except Exception:
             page_url = ""
         if "buffer.com" in page_url:
+            return total
+
+        # YouTube Studio upload shell: same class of false positives as Buffer —
+        # high-z fixed layers and modal backdrops are part of the real UI.
+        if "studio.youtube.com" in page_url or "youtube.com/upload" in page_url:
             return total
 
         # Phase 2: generic detector.

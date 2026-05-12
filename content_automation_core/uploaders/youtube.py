@@ -233,7 +233,11 @@ class YouTubeUploader:
         try:
             if not self._upload_file(video_path):
                 return False
+            if not self._ensure_upload_dialog_open("before-details"):
+                return False
             if not self._fill_video_details(title, description):
+                return False
+            if not self._ensure_upload_dialog_open("before-workflow"):
                 return False
             if not self._navigate_upload_workflow():
                 return False
@@ -350,10 +354,67 @@ class YouTubeUploader:
 
     # ── Step: fill title/description ───────────────────────────────────────
 
+    _UPLOAD_DIALOG = "//ytcp-uploads-dialog"
+
+    def _ensure_upload_dialog_open(self, where: str) -> bool:
+        """Fail fast if the upload wizard host is gone (e.g. overlay teardown)."""
+        try:
+            safe_driver_call(
+                lambda: WebDriverWait(self.session.driver, 12).until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "//ytcp-uploads-dialog")
+                    )
+                ),
+                timeout=18,
+            )
+            return True
+        except DriverUnhealthyError:
+            raise
+        except Exception:
+            logger.error(
+                f"{self.log_prefix}[DIALOG] upload dialog host missing — "
+                f"cannot continue ({where})"
+            )
+            self._dump_upload_dialog_state(where)
+            return False
+
+    def _dump_upload_dialog_state(self, where: str) -> None:
+        """Log whether ``ytcp-uploads-dialog`` exists (structural sanity check)."""
+        try:
+            info = safe_driver_call(
+                lambda: self.session.driver.execute_script(
+                    """
+                    var d = document.querySelector('ytcp-uploads-dialog');
+                    if (!d) return {present:false};
+                    var t = '';
+                    try { t = (d.innerText || d.textContent || '').trim(); } catch (e) {}
+                    return {present:true, textLen:t.length, head:t.slice(0, 160)};
+                    """
+                ),
+                timeout=8,
+            ) or {"present": False}
+        except Exception as e:
+            logger.warning(f"{self.log_prefix}[DIAG] dialog state failed at {where}: {e}")
+            return
+        logger.warning(
+            f"{self.log_prefix}[DIAG] {where} ytcp-uploads-dialog "
+            f"present={info.get('present')} textLen={info.get('textLen')} "
+            f"head={info.get('head')!r}"
+        )
+
     def _fill_video_details(self, title: str, description: str) -> bool:
         # Current Studio UI: ytcp-social-suggestions-textbox → div#textbox
         # (contenteditable). Legacy upload flow still has ytcp-mention-textbox.
+        dlg = self._UPLOAD_DIALOG
         title_selectors = (
+            f"{dlg}//ytcp-form-input-container[.//span[@id='label-text' "
+            "and contains(., 'Title')]]//div[@id='textbox'][@contenteditable='true']",
+            f"{dlg}//div[@id='textbox' and @role='textbox' "
+            "and contains(@aria-label, 'Add a title')]",
+            f"{dlg}//div[@id='textbox' and contains(@aria-label, 'title that describes')]",
+            f"{dlg}//ytcp-social-suggestions-textbox//div[@id='textbox' "
+            "and @aria-required='true']",
+            f"{dlg}//ytcp-mention-textbox[@label='Title']//div[@id='textbox']",
             "//ytcp-form-input-container[.//span[@id='label-text' "
             "and contains(., 'Title')]]//div[@id='textbox'][@contenteditable='true']",
             "//div[@id='textbox' and @role='textbox' "
@@ -369,6 +430,12 @@ class YouTubeUploader:
             logger.warning(f"{self.log_prefix}[DETAILS] title fill failed")
 
         description_selectors = (
+            f"{dlg}//ytcp-form-input-container[.//span[@id='label-text' "
+            "and normalize-space(.)='Description']]"
+            "//div[@id='textbox'][@contenteditable='true']",
+            f"{dlg}//div[@id='textbox' and @role='textbox' "
+            "and contains(@aria-label, 'Tell viewers about')]",
+            f"{dlg}//ytcp-mention-textbox[@label='Description']//div[@id='textbox']",
             "//ytcp-form-input-container[.//span[@id='label-text' "
             "and normalize-space(.)='Description']]"
             "//div[@id='textbox'][@contenteditable='true']",
@@ -377,7 +444,7 @@ class YouTubeUploader:
             "//ytcp-mention-textbox[@label='Description']//div[@id='textbox']",
         )
         if self._fill_textbox(
-            description_selectors, description, timeout=30, label="description"
+            description_selectors, description, timeout=45, label="description"
         ):
             logger.info(f"{self.log_prefix}[DETAILS] description filled")
         else:
@@ -496,6 +563,19 @@ class YouTubeUploader:
         logger.warning(
             f"{self.log_prefix}[DIAG] visible controls at {where}: {len(items)}"
         )
+        try:
+            dlg = safe_driver_call(
+                lambda: self.session.driver.execute_script(
+                    "return !!document.querySelector('ytcp-uploads-dialog');"
+                ),
+                timeout=5,
+            )
+            logger.warning(
+                f"{self.log_prefix}[DIAG] {where} "
+                f"ytcp-uploads-dialog-in-dom={bool(dlg)}"
+            )
+        except Exception:
+            pass
         for info in items:
             logger.warning(
                 f"{self.log_prefix}[DIAG] {where} "
@@ -550,7 +630,11 @@ class YouTubeUploader:
             pass
 
     _NEXT_BUTTON_XPATH = (
-        "//ytcp-button[@id='next-button']//button"
+        "//ytcp-uploads-dialog//ytcp-button[@id='next-button']//button"
+        " | //ytcp-uploads-dialog//button[@aria-label='Next']"
+        " | //ytcp-uploads-dialog//ytcp-button[@id='next-button']"
+        " | //ytcp-uploads-dialog//*[@id='next-button']"
+        " | //ytcp-button[@id='next-button']//button"
         " | //button[@aria-label='Next']"
         " | //ytcp-button[@id='next-button']"
         " | //*[@id='next-button']"
@@ -613,7 +697,17 @@ class YouTubeUploader:
     def _yt_click_visibility_radio(self, target: str) -> bool:
         """Polymer ``tp-yt-paper-radio-button``: click inner target, then JS."""
         title = target.capitalize()
+        dlg = self._UPLOAD_DIALOG
         xpaths = (
+            f"{dlg}//tp-yt-paper-radio-button[@name='{target}']//div[@id='radioContainer']",
+            f"{dlg}//tp-yt-paper-radio-button[@name='{target}']//div[@id='radioLabel']",
+            f"{dlg}//tp-yt-paper-radio-button[@name='{target}']",
+            f"{dlg}//paper-radio-button[@name='{target}']",
+            f"{dlg}//tp-yt-paper-radio-group[@id='privacy-radios']"
+            f"//tp-yt-paper-radio-button[contains(., '{title}')]",
+            f"{dlg}//*[normalize-space(text())='{title}']"
+            f"/ancestor::tp-yt-paper-radio-button",
+            f"{dlg}//*[normalize-space(text())='{title}']/ancestor::paper-radio-button",
             f"//tp-yt-paper-radio-button[@name='{target}']//div[@id='radioContainer']",
             f"//tp-yt-paper-radio-button[@name='{target}']//div[@id='radioLabel']",
             f"//tp-yt-paper-radio-button[@name='{target}']",
@@ -642,7 +736,10 @@ class YouTubeUploader:
         try:
             radios = safe_driver_call(
                 lambda: self.session.driver.find_elements(
-                    By.XPATH, "//tp-yt-paper-radio-button | //paper-radio-button"
+                    By.XPATH,
+                    "//ytcp-uploads-dialog//tp-yt-paper-radio-button | "
+                    "//ytcp-uploads-dialog//paper-radio-button | "
+                    "//tp-yt-paper-radio-button | //paper-radio-button",
                 ),
                 timeout=8,
             ) or []
@@ -667,6 +764,8 @@ class YouTubeUploader:
                     """
                     var name = arguments[0];
                     var el = document.querySelector(
+                        'ytcp-uploads-dialog tp-yt-paper-radio-button[name="' + name + '"]'
+                    ) || document.querySelector(
                         'tp-yt-paper-radio-button[name="' + name + '"]'
                     );
                     if (!el) return false;
@@ -686,7 +785,22 @@ class YouTubeUploader:
 
     def _yt_click_publish(self) -> bool:
         """Publish / Save with XPath round-robin + JS fallback (waits up to ~70s)."""
+        dlg = self._UPLOAD_DIALOG
         save_xpaths = (
+            f"{dlg}//ytcp-button[@id='done-button']//button",
+            f"{dlg}//button[@aria-label='Publish' and not(@aria-disabled='true')]",
+            f"{dlg}//button[@aria-label='Publish']",
+            f"{dlg}//ytcp-button[@id='done-button']",
+            f"{dlg}//*[@id='done-button']",
+            f"{dlg}//button[@aria-label='Save']",
+            f"{dlg}//button[@aria-label='Schedule']",
+            f"{dlg}//button[normalize-space(text())='Publish']",
+            f"{dlg}//button[normalize-space(text())='Save']",
+            f"{dlg}//ytcp-button[contains(., 'Publish')]//button",
+            f"{dlg}//ytcp-button[contains(., 'Save')]//button",
+            f"{dlg}//*[normalize-space(text())='Publish']/ancestor::ytcp-button",
+            f"{dlg}//*[normalize-space(text())='Save']/ancestor::ytcp-button",
+            f"{dlg}//*[normalize-space(text())='Schedule']/ancestor::ytcp-button",
             "//ytcp-button[@id='done-button']//button",
             "//button[@aria-label='Publish' and not(@aria-disabled='true')]",
             "//button[@aria-label='Publish']",
@@ -701,7 +815,6 @@ class YouTubeUploader:
             "//button[normalize-space(text())='Done']",
             "//ytcp-button[contains(., 'Publish')]//button",
             "//ytcp-button[contains(., 'Save')]//button",
-            # text → ancestor (works when text lives in nested div)
             "//*[normalize-space(text())='Publish']/ancestor::ytcp-button",
             "//*[normalize-space(text())='Save']/ancestor::ytcp-button",
             "//*[normalize-space(text())='Schedule']/ancestor::ytcp-button",
@@ -740,6 +853,8 @@ class YouTubeUploader:
                 ok = safe_driver_call(
                     lambda: self.session.driver.execute_script(
                         """
+                        var root = document.querySelector('ytcp-uploads-dialog')
+                            || document;
                         var sel = [
                           'ytcp-button#done-button button',
                           'button[aria-label="Publish"]',
@@ -749,7 +864,7 @@ class YouTubeUploader:
                           'ytcp-button#done-button'
                         ];
                         for (var s = 0; s < sel.length; s++) {
-                          var nodes = document.querySelectorAll(sel[s]);
+                          var nodes = root.querySelectorAll(sel[s]);
                           for (var i = 0; i < nodes.length; i++) {
                             var b = nodes[i];
                             if (b.getAttribute('aria-disabled') === 'true') continue;
