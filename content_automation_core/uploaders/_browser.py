@@ -622,10 +622,16 @@ class BrowserSession:
         if self.profile_path:
             opts.add_argument(f"--user-data-dir={self.profile_path}")
         opts.add_argument("--window-size=1920,1080")
+        opts.add_argument("--start-maximized")
         opts.add_argument("--no-first-run")
         opts.add_argument("--no-default-browser-check")
         opts.add_argument("--disable-session-crashed-bubble")
-        opts.add_argument("--restore-last-session=false")
+        # NOTE: Do NOT add ``--restore-last-session`` (even with =false). In
+        # Chromium that switch is presence-only — passing it ENABLES session
+        # restore regardless of the value, which re-opens previous tabs and
+        # leaves the Studio tab in the background where lazy-rendered footer
+        # controls (Publish/Save) can be JS-throttled.
+        opts.add_argument("--disable-features=InfiniteSessionRestore")
         opts.add_argument("--disable-blink-features=AutomationControlled")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
@@ -652,6 +658,19 @@ class BrowserSession:
             driver.set_script_timeout(SCRIPT_TIMEOUT)
         except WebDriverException:
             pass
+
+        # Force a known viewport even if profile preferences saved a smaller
+        # window size. Studio's ytcp-uploads-dialog renders its footer
+        # (Publish/Save/Done) only when the viewport is tall enough.
+        try:
+            driver.set_window_size(1920, 1080)
+        except WebDriverException:
+            pass
+        try:
+            driver.maximize_window()
+        except WebDriverException:
+            pass
+
         try:
             driver.execute_script(
                 "Object.defineProperty(navigator, 'webdriver', "
@@ -686,6 +705,52 @@ class BrowserSession:
             f"{self.log_prefix}[BROWSER] started "
             f"(chromedriver_pid={cd_pid}, chrome_pids={len(self._chrome_pids)})"
         )
+
+        # Collapse any session-restored tabs down to one. Profiles that exited
+        # uncleanly (or have multi-tab "Continue where you left off" set) open
+        # several tabs; if the Studio tab is not the active one, Chrome moves
+        # it to the background where lazy-rendered controls are JS-throttled
+        # and the upload dialog footer can stay invisible indefinitely.
+        try:
+            self._collapse_to_single_tab()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"{self.log_prefix}[BROWSER] tab collapse failed: {e}")
+
+    def _collapse_to_single_tab(self) -> None:
+        """Close every window/tab except one, then switch to the survivor."""
+        if not self.driver:
+            return
+        try:
+            handles = list(self.driver.window_handles)
+        except WebDriverException:
+            return
+        if len(handles) <= 1:
+            return
+
+        # Pick the first handle as the survivor; close everything else.
+        survivor = handles[0]
+        closed = 0
+        for h in handles[1:]:
+            try:
+                self.driver.switch_to.window(h)
+                self.driver.close()
+                closed += 1
+            except WebDriverException as e:
+                logger.debug(f"{self.log_prefix}[BROWSER] tab close failed: {e}")
+        try:
+            self.driver.switch_to.window(survivor)
+        except WebDriverException:
+            try:
+                remaining = list(self.driver.window_handles)
+                if remaining:
+                    self.driver.switch_to.window(remaining[0])
+            except WebDriverException:
+                pass
+        if closed:
+            logger.info(
+                f"{self.log_prefix}[BROWSER] collapsed {closed} extra tab(s) "
+                f"down to 1 — Studio tab will stay foreground"
+            )
 
     def force_close(self) -> Dict[str, object]:
         """
