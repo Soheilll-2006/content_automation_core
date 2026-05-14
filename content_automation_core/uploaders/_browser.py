@@ -628,10 +628,9 @@ class BrowserSession:
         opts.add_argument("--disable-session-crashed-bubble")
         # NOTE: Do NOT add ``--restore-last-session`` (even with =false). In
         # Chromium that switch is presence-only — passing it ENABLES session
-        # restore regardless of the value, which re-opens previous tabs and
-        # leaves the Studio tab in the background where lazy-rendered footer
-        # controls (Publish/Save) can be JS-throttled.
-        opts.add_argument("--disable-features=InfiniteSessionRestore")
+        # restore regardless of the value. We rely on
+        # ``_collapse_to_single_tab()`` after start() to drop any tabs that
+        # session-restore reopened.
         opts.add_argument("--disable-blink-features=AutomationControlled")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
@@ -717,8 +716,25 @@ class BrowserSession:
             logger.debug(f"{self.log_prefix}[BROWSER] tab collapse failed: {e}")
 
     def _collapse_to_single_tab(self) -> None:
-        """Close every window/tab except one, then switch to the survivor."""
+        """Close every window/tab except the one Selenium is currently driving.
+
+        CRITICAL: must use ``current_window_handle`` (not ``handles[0]``) as
+        the survivor — handle order is not guaranteed, and closing the
+        chromedriver-controlled tab causes the entire Chrome process to exit
+        and the session id to become invalid.
+
+        Any failure here is non-fatal: better to leave session-restored tabs
+        open than to kill the whole session.
+        """
         if not self.driver:
+            return
+        try:
+            survivor = self.driver.current_window_handle
+        except WebDriverException as e:
+            logger.debug(
+                f"{self.log_prefix}[BROWSER] tab collapse skipped "
+                f"(current_window_handle failed): {e}"
+            )
             return
         try:
             handles = list(self.driver.window_handles)
@@ -726,11 +742,17 @@ class BrowserSession:
             return
         if len(handles) <= 1:
             return
+        if survivor not in handles:
+            logger.debug(
+                f"{self.log_prefix}[BROWSER] tab collapse skipped "
+                f"(survivor not in handles)"
+            )
+            return
 
-        # Pick the first handle as the survivor; close everything else.
-        survivor = handles[0]
         closed = 0
-        for h in handles[1:]:
+        for h in handles:
+            if h == survivor:
+                continue
             try:
                 self.driver.switch_to.window(h)
                 self.driver.close()
@@ -739,7 +761,10 @@ class BrowserSession:
                 logger.debug(f"{self.log_prefix}[BROWSER] tab close failed: {e}")
         try:
             self.driver.switch_to.window(survivor)
-        except WebDriverException:
+        except WebDriverException as e:
+            logger.debug(
+                f"{self.log_prefix}[BROWSER] switch back to survivor failed: {e}"
+            )
             try:
                 remaining = list(self.driver.window_handles)
                 if remaining:
