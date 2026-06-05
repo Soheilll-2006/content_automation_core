@@ -150,10 +150,29 @@ class GeminiImageGenerator:
             img_element.hover()
             time.sleep(1.5)
 
-            download_btn = next_ai_block.locator(
-                "button[data-test-id='download-generated-image-button']"
+            # Gemini UI (2026): Material icon button with aria-label + download icon.
+            download_selectors = (
+                "button[aria-label='Download full size image']",
+                "button[aria-label*='Download full size']",
+                "button:has(mat-icon[data-mat-icon-name='download'])",
+                "button:has(mat-icon[fonticon='download'])",
+                "button[data-test-id='download-generated-image-button']",
             )
-            download_btn.wait_for(state="visible", timeout=10_000)
+            download_btn = None
+            for sel in download_selectors:
+                candidate = next_ai_block.locator(sel).first
+                try:
+                    candidate.wait_for(state="visible", timeout=5_000)
+                    download_btn = candidate
+                    logger.debug("Download button found via: %s", sel)
+                    break
+                except Exception:
+                    continue
+            if download_btn is None:
+                raise RuntimeError(
+                    "Gemini download button not found — tried: "
+                    + ", ".join(download_selectors)
+                )
 
             with page.expect_download(timeout=60_000) as dl_info:
                 download_btn.click()
